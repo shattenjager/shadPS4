@@ -4,6 +4,9 @@
 #include <QCompleter>
 #include <QDirIterator>
 
+#include "check_update.h"
+#include "common/logging/backend.h"
+#include "common/logging/filter.h"
 #include "main_window.h"
 #include "settings_dialog.h"
 #include "ui_settings_dialog.h"
@@ -78,6 +81,11 @@ SettingsDialog::SettingsDialog(std::span<const QString> physical_devices, QWidge
                     Config::setDefaultValues();
                     LoadValuesFromConfig();
                 }
+                if (Common::Log::IsActive()) {
+                    Common::Log::Filter filter;
+                    filter.ParseFilterString(Config::getLogFilter());
+                    Common::Log::SetGlobalFilter(filter);
+                }
             });
 
     ui->buttonBox->button(QDialogButtonBox::Save)->setText(tr("Save"));
@@ -115,6 +123,20 @@ SettingsDialog::SettingsDialog(std::span<const QString> physical_devices, QWidge
 
         connect(ui->logFilterLineEdit, &QLineEdit::textChanged, this,
                 [](const QString& text) { Config::setLogFilter(text.toStdString()); });
+
+        connect(ui->updateCheckBox, &QCheckBox::stateChanged, this,
+                [](int state) { Config::setAutoUpdate(state == Qt::Checked); });
+
+        connect(ui->updateComboBox, &QComboBox::currentTextChanged, this,
+                [](const QString& channel) { Config::setUpdateChannel(channel.toStdString()); });
+
+        connect(ui->checkUpdateButton, &QPushButton::clicked, this, []() {
+            auto checkUpdate = new CheckUpdate(true);
+            checkUpdate->exec();
+        });
+
+        connect(ui->playBGMCheckBox, &QCheckBox::stateChanged, this,
+                [](int val) { Config::setPlayBGM(val); });
     }
 
     // GPU TAB
@@ -173,7 +195,7 @@ void SettingsDialog::LoadValuesFromConfig() {
     ui->dumpShadersCheckBox->setChecked(Config::dumpShaders());
     ui->nullGpuCheckBox->setChecked(Config::nullGpu());
     ui->dumpPM4CheckBox->setChecked(Config::dumpPM4());
-
+    ui->playBGMCheckBox->setChecked(Config::getPlayBGM());
     ui->fullscreenCheckBox->setChecked(Config::isFullscreenMode());
     ui->showSplashCheckBox->setChecked(Config::showSplash());
     ui->ps4proCheckBox->setChecked(Config::isNeoMode());
@@ -185,6 +207,9 @@ void SettingsDialog::LoadValuesFromConfig() {
     ui->vkValidationCheckBox->setChecked(Config::vkValidationEnabled());
     ui->vkSyncValidationCheckBox->setChecked(Config::vkValidationSyncEnabled());
     ui->rdocCheckBox->setChecked(Config::isRdocEnabled());
+
+    ui->updateCheckBox->setChecked(Config::autoUpdate());
+    ui->updateComboBox->setCurrentText(QString::fromStdString(Config::getUpdateChannel()));
 }
 
 void SettingsDialog::InitializeEmulatorLanguages() {

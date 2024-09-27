@@ -171,10 +171,10 @@ T Translator::GetSrc(const InstOperand& operand) {
         }
     } else {
         if (operand.input_modifier.abs) {
-            LOG_WARNING(Render_Vulkan, "Input abs modifier on integer instruction");
+            value = ir.IAbs(value);
         }
         if (operand.input_modifier.neg) {
-            UNREACHABLE();
+            value = ir.INeg(value);
         }
     }
     return value;
@@ -211,7 +211,7 @@ T Translator::GetSrc64(const InstOperand& operand) {
         const auto value_lo = ir.GetVectorReg(IR::VectorReg(operand.code));
         const auto value_hi = ir.GetVectorReg(IR::VectorReg(operand.code + 1));
         if constexpr (is_float) {
-            UNREACHABLE();
+            value = ir.PackFloat2x32(ir.CompositeConstruct(value_lo, value_hi));
         } else {
             value = ir.PackUint2x32(ir.CompositeConstruct(value_lo, value_hi));
         }
@@ -281,12 +281,15 @@ template IR::F64 Translator::GetSrc64<IR::F64>(const InstOperand&);
 
 void Translator::SetDst(const InstOperand& operand, const IR::U32F32& value) {
     IR::U32F32 result = value;
-    if (operand.output_modifier.multiplier != 0.f) {
-        result = ir.FPMul(result, ir.Imm32(operand.output_modifier.multiplier));
+    if (value.Type() == IR::Type::F32) {
+        if (operand.output_modifier.multiplier != 0.f) {
+            result = ir.FPMul(result, ir.Imm32(operand.output_modifier.multiplier));
+        }
+        if (operand.output_modifier.clamp) {
+            result = ir.FPSaturate(value);
+        }
     }
-    if (operand.output_modifier.clamp) {
-        result = ir.FPSaturate(value);
-    }
+
     switch (operand.field) {
     case OperandField::ScalarGPR:
         return ir.SetScalarReg(IR::ScalarReg(operand.code), result);

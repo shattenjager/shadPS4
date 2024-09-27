@@ -200,18 +200,12 @@ ImageInfo::ImageInfo(const AmdGpu::Liverpool::DepthBuffer& buffer, u32 num_slice
     mips_layout.emplace_back(depth_slice_sz, pitch, 0);
 }
 
-ImageInfo::ImageInfo(const AmdGpu::Image& image, bool force_depth /*= false*/) noexcept {
+ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& desc) noexcept {
     tiling_mode = image.GetTilingMode();
     pixel_format = LiverpoolToVK::SurfaceFormat(image.GetDataFmt(), image.GetNumberFmt());
     // Override format if image is forced to be a depth target
-    if (force_depth || tiling_mode == AmdGpu::TilingMode::Depth_MacroTiled) {
-        if (pixel_format == vk::Format::eR32Sfloat || pixel_format == vk::Format::eR8Unorm) {
-            pixel_format = vk::Format::eD32SfloatS8Uint;
-        } else if (pixel_format == vk::Format::eR16Unorm) {
-            pixel_format = vk::Format::eD16UnormS8Uint;
-        } else {
-            UNREACHABLE();
-        }
+    if (desc.is_depth) {
+        pixel_format = LiverpoolToVK::PromoteFormatToDepth(pixel_format);
     }
     type = ConvertImageType(image.GetType());
     props.is_tiled = image.IsTiled();
@@ -224,7 +218,7 @@ ImageInfo::ImageInfo(const AmdGpu::Image& image, bool force_depth /*= false*/) n
     size.depth = props.is_volume ? image.depth + 1 : 1;
     pitch = image.Pitch();
     resources.levels = image.NumLevels();
-    resources.layers = image.NumLayers();
+    resources.layers = image.NumLayers(desc.is_array);
     num_bits = NumBits(image.GetDataFmt());
     usage.texture = true;
 
@@ -260,7 +254,6 @@ void ImageInfo::UpdateSize() {
 
         switch (tiling_mode) {
         case AmdGpu::TilingMode::Display_Linear: {
-            ASSERT(!props.is_cube);
             std::tie(mip_info.pitch, mip_info.size) =
                 ImageSizeLinearAligned(mip_w, mip_h, bpp, num_samples);
             mip_info.height = mip_h;

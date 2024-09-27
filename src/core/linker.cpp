@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/alignment.h"
+#include "common/arch.h"
 #include "common/assert.h"
 #include "common/config.h"
 #include "common/logging/log.h"
@@ -27,6 +28,7 @@ static PS4_SYSV_ABI void ProgramExitFunc() {
 }
 
 static void RunMainEntry(VAddr addr, EntryParams* params, ExitFunc exit_func) {
+#ifdef ARCH_X86_64
     // reinterpret_cast<entry_func_t>(addr)(params, exit_func); // can't be used, stack has to have
     // a specific layout
     asm volatile("andq $-16, %%rsp\n" // Align to 16 bytes
@@ -46,6 +48,9 @@ static void RunMainEntry(VAddr addr, EntryParams* params, ExitFunc exit_func) {
                  :
                  : "r"(addr), "r"(params), "r"(exit_func)
                  : "rax", "rsi", "rdi");
+#else
+    UNIMPLEMENTED_MSG("Missing RunMainEntry() implementation for target CPU architecture.");
+#endif
 }
 
 Linker::Linker() : memory{Memory::Instance()} {}
@@ -85,9 +90,8 @@ void Linker::Execute() {
 
     // Init primary thread.
     Common::SetCurrentThreadName("GAME_MainThread");
-    InitializeThreadPatchStack();
     Libraries::Kernel::pthreadInitSelfMainThread();
-    InitTlsForThread(true);
+    EnsureThreadInitialized(true);
 
     // Start shared library modules
     for (auto& m : m_modules) {
@@ -326,6 +330,17 @@ void* Linker::TlsGetAddr(u64 module_index, u64 offset) {
         addr = dest;
     }
     return addr + offset;
+}
+
+thread_local std::once_flag init_tls_flag;
+
+void Linker::EnsureThreadInitialized(bool is_primary) {
+    std::call_once(init_tls_flag, [this, is_primary] {
+#ifdef ARCH_X86_64
+        InitializeThreadPatchStack();
+#endif
+        InitTlsForThread(is_primary);
+    });
 }
 
 void Linker::InitTlsForThread(bool is_primary) {

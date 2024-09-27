@@ -30,11 +30,12 @@ public:
     std::string GetDriverVersionName();
 
     /// Gets a compatibility format if the format is not supported.
-    [[nodiscard]] vk::Format GetSupportedFormat(vk::Format format) const;
+    [[nodiscard]] vk::Format GetSupportedFormat(vk::Format format,
+                                                vk::FormatFeatureFlags2 flags) const;
 
     /// Re-orders a component swizzle for format compatibility, if needed.
     [[nodiscard]] vk::ComponentMapping GetSupportedComponentSwizzle(
-        vk::Format format, vk::ComponentMapping swizzle) const;
+        vk::Format format, vk::ComponentMapping swizzle, vk::FormatFeatureFlags2 flags) const;
 
     /// Returns the Vulkan instance
     vk::Instance GetInstance() const {
@@ -132,6 +133,11 @@ public:
         return vertex_input_dynamic_state;
     }
 
+    /// Returns true when the nullDescriptor feature of VK_EXT_robustness2 is supported.
+    bool IsNullDescriptorSupported() const {
+        return null_descriptor;
+    }
+
     /// Returns the vendor ID of the physical device
     u32 GetVendorID() const {
         return properties.vendorID;
@@ -207,6 +213,11 @@ public:
         return properties.limits.maxTexelBufferElements;
     }
 
+    /// Returns the maximum number of push descriptors.
+    u32 MaxPushDescriptors() const {
+        return push_descriptor_props.maxPushDescriptors;
+    }
+
     /// Returns true if shaders can declare the ClipDistance attribute
     bool IsShaderClipDistanceSupported() const {
         return features.shaderClipDistance;
@@ -215,6 +226,13 @@ public:
     /// Returns the minimum imported host pointer alignment
     u64 GetMinImportedHostPointerAlignment() const {
         return min_imported_host_pointer_alignment;
+    }
+
+    /// Returns the sample count flags supported by framebuffers.
+    vk::SampleCountFlags GetFramebufferSampleCounts() const {
+        return properties.limits.framebufferColorSampleCounts &
+               properties.limits.framebufferDepthSampleCounts &
+               properties.limits.framebufferStencilSampleCounts;
     }
 
 private:
@@ -228,20 +246,15 @@ private:
     void CollectDeviceParameters();
     void CollectToolingInfo();
 
-    /// Determines if a format is supported for images.
-    [[nodiscard]] bool IsImageFormatSupported(vk::Format format) const;
-
-    /// Determines if a format is supported for vertex buffers.
-    [[nodiscard]] bool IsVertexFormatSupported(vk::Format format) const;
-
-    /// Gets a commonly available alternative for an unsupported pixel format.
-    vk::Format GetAlternativeFormat(const vk::Format format) const;
+    /// Determines if a format is supported for a set of feature flags.
+    [[nodiscard]] bool IsFormatSupported(vk::Format format, vk::FormatFeatureFlags2 flags) const;
 
 private:
     vk::UniqueInstance instance;
     vk::PhysicalDevice physical_device;
     vk::UniqueDevice device;
     vk::PhysicalDeviceProperties properties;
+    vk::PhysicalDevicePushDescriptorPropertiesKHR push_descriptor_props;
     vk::PhysicalDeviceFeatures features;
     vk::DriverIdKHR driver_id;
     vk::UniqueDebugUtilsMessengerEXT debug_callback{};
@@ -251,7 +264,7 @@ private:
     vk::Queue graphics_queue;
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
-    std::unordered_map<vk::Format, vk::FormatProperties> format_properties;
+    std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
     TracyVkCtx profiler_context{};
     u32 queue_family_index{0};
     bool image_view_reinterpretation{true};
@@ -266,6 +279,7 @@ private:
     bool workgroup_memory_explicit_layout{};
     bool color_write_en{};
     bool vertex_input_dynamic_state{};
+    bool null_descriptor{};
     u64 min_imported_host_pointer_alignment{};
     u32 subgroup_size{};
     bool tooling_info{};

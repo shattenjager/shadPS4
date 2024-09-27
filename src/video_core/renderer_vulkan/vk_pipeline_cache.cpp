@@ -24,6 +24,15 @@ using Shader::VsOutput;
     return seed ^ (hash + 0x9e3779b9 + (seed << 6) + (seed >> 2));
 }
 
+constexpr static std::array DescriptorHeapSizes = {
+    vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer, 8192},
+    vk::DescriptorPoolSize{vk::DescriptorType::eStorageBuffer, 1024},
+    vk::DescriptorPoolSize{vk::DescriptorType::eUniformTexelBuffer, 128},
+    vk::DescriptorPoolSize{vk::DescriptorType::eStorageTexelBuffer, 128},
+    vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage, 8192},
+    vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 1024},
+};
+
 void GatherVertexOutputs(Shader::VertexRuntimeInfo& info,
                          const AmdGpu::Liverpool::VsOutputControl& ctl) {
     const auto add_output = [&](VsOutput x, VsOutput y, VsOutput z, VsOutput w) {
@@ -120,13 +129,17 @@ Shader::RuntimeInfo PipelineCache::BuildRuntimeInfo(Shader::Stage stage) {
 
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_)
-    : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_} {
+    : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
+      desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes} {
     profile = Shader::Profile{
         .supported_spirv = instance.ApiVersion() >= VK_API_VERSION_1_3 ? 0x00010600U : 0x00010500U,
         .subgroup_size = instance.SubgroupSize(),
         .support_explicit_workgroup_layout = true,
     };
-    pipeline_cache = instance.GetDevice().createPipelineCacheUnique({});
+    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
+    ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
+               vk::to_string(cache_result));
+    pipeline_cache = std::move(cache);
 }
 
 PipelineCache::~PipelineCache() = default;
@@ -148,16 +161,19 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         LOG_TRACE(Render_Vulkan, "FMask decompression pass skipped");
         return nullptr;
     }
+    if (regs.primitive_type == Liverpool::PrimitiveType::None) {
+        LOG_TRACE(Render_Vulkan, "Primitive type 'None' skipped");
+        return nullptr;
+    }
     if (!RefreshGraphicsKey()) {
         return nullptr;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
-        it.value() = std::make_unique<GraphicsPipeline>(instance, scheduler, graphics_key,
-                                                        *pipeline_cache, infos, modules);
+        it.value() = graphics_pipeline_pool.Create(instance, scheduler, desc_heap, graphics_key,
+                                                   *pipeline_cache, infos, modules);
     }
-    const GraphicsPipeline* pipeline = it->second.get();
-    return pipeline;
+    return it->second;
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
@@ -166,11 +182,10 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     if (is_new) {
-        it.value() = std::make_unique<ComputePipeline>(instance, scheduler, *pipeline_cache,
-                                                       compute_key, *infos[0], modules[0]);
+        it.value() = compute_pipeline_pool.Create(instance, scheduler, desc_heap, *pipeline_cache,
+                                                  compute_key, *infos[0], modules[0]);
     }
-    const ComputePipeline* pipeline = it->second.get();
-    return pipeline;
+    return it->second;
 }
 
 bool ShouldSkipShader(u64 shader_hash, const char* shader_type) {
@@ -183,28 +198,36 @@ bool ShouldSkipShader(u64 shader_hash, const char* shader_type) {
 }
 
 bool PipelineCache::RefreshGraphicsKey() {
+    std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
+
     auto& regs = liverpool->regs;
     auto& key = graphics_key;
 
-    key.depth = regs.depth_control;
-    key.depth.depth_write_enable.Assign(regs.depth_control.depth_write_enable.Value() &&
-                                        !regs.depth_render_control.depth_clear_enable);
-    key.depth_bounds_min = regs.depth_bounds_min;
-    key.depth_bounds_max = regs.depth_bounds_max;
-    key.depth_bias_enable = regs.polygon_control.enable_polygon_offset_back ||
-                            regs.polygon_control.enable_polygon_offset_front ||
-                            regs.polygon_control.enable_polygon_offset_para;
-    if (regs.polygon_control.enable_polygon_offset_front) {
-        key.depth_bias_const_factor = regs.poly_offset.front_offset;
-        key.depth_bias_slope_factor = regs.poly_offset.front_scale;
+    key.depth_stencil = regs.depth_control;
+    key.depth_stencil.depth_write_enable.Assign(regs.depth_control.depth_write_enable.Value() &&
+                                                !regs.depth_render_control.depth_clear_enable);
+    key.depth_bias_enable = regs.polygon_control.NeedsBias();
+
+    const auto& db = regs.depth_buffer;
+    const auto ds_format = LiverpoolToVK::DepthFormat(db.z_info.format, db.stencil_info.format);
+    if (db.z_info.format != AmdGpu::Liverpool::DepthBuffer::ZFormat::Invalid) {
+        key.depth_format = ds_format;
     } else {
-        key.depth_bias_const_factor = regs.poly_offset.back_offset;
-        key.depth_bias_slope_factor = regs.poly_offset.back_scale;
+        key.depth_format = vk::Format::eUndefined;
     }
-    key.depth_bias_clamp = regs.poly_offset.depth_bias;
+    if (regs.depth_control.depth_enable) {
+        key.depth_stencil.depth_enable.Assign(key.depth_format != vk::Format::eUndefined);
+    }
     key.stencil = regs.stencil_control;
-    key.stencil_ref_front = regs.stencil_ref_front;
-    key.stencil_ref_back = regs.stencil_ref_back;
+
+    if (db.stencil_info.format != AmdGpu::Liverpool::DepthBuffer::StencilFormat::Invalid) {
+        key.stencil_format = key.depth_format;
+    } else {
+        key.stencil_format = vk::Format::eUndefined;
+    }
+    if (key.depth_stencil.stencil_enable) {
+        key.depth_stencil.stencil_enable.Assign(key.stencil_format != vk::Format::eUndefined);
+    }
     key.prim_type = regs.primitive_type;
     key.enable_primitive_restart = regs.enable_primitive_restart & 1;
     key.primitive_restart_index = regs.primitive_restart_index;
@@ -214,39 +237,20 @@ bool PipelineCache::RefreshGraphicsKey() {
     key.front_face = regs.polygon_control.front_face;
     key.num_samples = regs.aa_config.NumSamples();
 
-    const auto& db = regs.depth_buffer;
-    const auto ds_format = LiverpoolToVK::DepthFormat(db.z_info.format, db.stencil_info.format);
-
-    if (db.z_info.format != AmdGpu::Liverpool::DepthBuffer::ZFormat::Invalid) {
-        key.depth_format = ds_format;
-    } else {
-        key.depth_format = vk::Format::eUndefined;
-    }
-    if (key.depth.depth_enable) {
-        key.depth.depth_enable.Assign(key.depth_format != vk::Format::eUndefined);
-    }
-
-    if (db.stencil_info.format != AmdGpu::Liverpool::DepthBuffer::StencilFormat::Invalid) {
-        key.stencil_format = key.depth_format;
-    } else {
-        key.stencil_format = vk::Format::eUndefined;
-    }
-    if (key.depth.stencil_enable) {
-        key.depth.stencil_enable.Assign(key.stencil_format != vk::Format::eUndefined);
-    }
-
-    const auto skip_cb_binding =
+    const bool skip_cb_binding =
         regs.color_control.mode == AmdGpu::Liverpool::ColorControl::OperationMode::Disable;
 
     // `RenderingInfo` is assumed to be initialized with a contiguous array of valid color
-    // attachments. This might be not a case as HW color buffers can be bound in an arbitrary order.
-    // We need to do some arrays compaction at this stage
+    // attachments. This might be not a case as HW color buffers can be bound in an arbitrary
+    // order. We need to do some arrays compaction at this stage
     key.color_formats.fill(vk::Format::eUndefined);
     key.blend_controls.fill({});
     key.write_masks.fill({});
     key.mrt_swizzles.fill(Liverpool::ColorBuffer::SwapMode::Standard);
-    int remapped_cb{};
-    for (auto cb = 0u; cb < Liverpool::NumColorBuffers; ++cb) {
+
+    // First pass of bindings check to idenitfy formats and swizzles and pass them to rhe shader
+    // recompiler.
+    for (auto cb = 0u, remapped_cb = 0u; cb < Liverpool::NumColorBuffers; ++cb) {
         auto const& col_buf = regs.color_buffers[cb];
         if (skip_cb_binding || !col_buf || !regs.color_target_mask.GetMask(cb)) {
             continue;
@@ -259,16 +263,11 @@ bool PipelineCache::RefreshGraphicsKey() {
         if (base_format == key.color_formats[remapped_cb]) {
             key.mrt_swizzles[remapped_cb] = col_buf.info.comp_swap.Value();
         }
-        key.blend_controls[remapped_cb] = regs.blend_control[cb];
-        key.blend_controls[remapped_cb].enable.Assign(key.blend_controls[remapped_cb].enable &&
-                                                      !col_buf.info.blend_bypass);
-        key.write_masks[remapped_cb] = vk::ColorComponentFlags{regs.color_target_mask.GetMask(cb)};
-        key.cb_shader_mask = regs.color_shader_mask;
 
         ++remapped_cb;
     }
 
-    u32 binding{};
+    Shader::Backend::Bindings binding{};
     for (u32 i = 0; i < MaxShaderStages; i++) {
         if (!regs.stage_enable.IsStageEnabled(i)) {
             key.stage_hashes[i] = 0;
@@ -310,11 +309,33 @@ bool PipelineCache::RefreshGraphicsKey() {
 
         std::tie(infos[i], modules[i], key.stage_hashes[i]) = GetProgram(stage, params, binding);
     }
+
+    const auto* fs_info = infos[u32(Shader::Stage::Fragment)];
+    key.mrt_mask = fs_info ? fs_info->mrt_mask : 0u;
+
+    // Second pass to fill remain CB pipeline key data
+    for (auto cb = 0u, remapped_cb = 0u; cb < Liverpool::NumColorBuffers; ++cb) {
+        auto const& col_buf = regs.color_buffers[cb];
+        if (skip_cb_binding || !col_buf || !regs.color_target_mask.GetMask(cb) ||
+            (key.mrt_mask & (1u << cb)) == 0) {
+            key.color_formats[cb] = vk::Format::eUndefined;
+            key.mrt_swizzles[cb] = Liverpool::ColorBuffer::SwapMode::Standard;
+            continue;
+        }
+
+        key.blend_controls[remapped_cb] = regs.blend_control[cb];
+        key.blend_controls[remapped_cb].enable.Assign(key.blend_controls[remapped_cb].enable &&
+                                                      !col_buf.info.blend_bypass);
+        key.write_masks[remapped_cb] = vk::ColorComponentFlags{regs.color_target_mask.GetMask(cb)};
+        key.cb_shader_mask.SetMask(remapped_cb, regs.color_shader_mask.GetMask(cb));
+
+        ++remapped_cb;
+    }
     return true;
 }
 
 bool PipelineCache::RefreshComputeKey() {
-    u32 binding{};
+    Shader::Backend::Bindings binding{};
     const auto* cs_pgm = &liverpool->regs.cs_program;
     const auto cs_params = Liverpool::GetParams(*cs_pgm);
     if (ShouldSkipShader(cs_params.hash, "compute")) {
@@ -328,7 +349,7 @@ bool PipelineCache::RefreshComputeKey() {
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info,
                                               const Shader::RuntimeInfo& runtime_info,
                                               std::span<const u32> code, size_t perm_idx,
-                                              u32& binding) {
+                                              Shader::Backend::Bindings& binding) {
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     if (Config::dumpShaders()) {
@@ -348,14 +369,14 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info,
 }
 
 std::tuple<const Shader::Info*, vk::ShaderModule, u64> PipelineCache::GetProgram(
-    Shader::Stage stage, Shader::ShaderParams params, u32& binding) {
+    Shader::Stage stage, Shader::ShaderParams params, Shader::Backend::Bindings& binding) {
     const auto runtime_info = BuildRuntimeInfo(stage);
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
         Program* program = program_pool.Create(stage, params);
-        u32 start_binding = binding;
+        auto start = binding;
         const auto module = CompileModule(program->info, runtime_info, params.code, 0, binding);
-        const auto spec = Shader::StageSpecialization(program->info, runtime_info, start_binding);
+        const auto spec = Shader::StageSpecialization(program->info, runtime_info, start);
         program->AddPermut(module, std::move(spec));
         it_pgm.value() = program;
         return std::make_tuple(&program->info, module, HashCombine(params.hash, 0));
@@ -373,7 +394,7 @@ std::tuple<const Shader::Info*, vk::ShaderModule, u64> PipelineCache::GetProgram
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
         program->AddPermut(module, std::move(spec));
     } else {
-        binding += info.NumBindings();
+        info.AddBindings(binding);
         module = it->module;
         perm_idx = std::distance(program->modules.begin(), it);
     }

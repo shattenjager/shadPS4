@@ -31,6 +31,27 @@ endif()
 
 option(ENABLE_QT_GUI "Enable the Qt GUI. If not selected then the emulator uses a minimal SDL-based UI instead" OFF)
 
+# First, determine whether to use CMAKE_OSX_ARCHITECTURES or CMAKE_SYSTEM_PROCESSOR.
+if (APPLE AND CMAKE_OSX_ARCHITECTURES)
+    set(BASE_ARCHITECTURE "${CMAKE_OSX_ARCHITECTURES}")
+else()
+    set(BASE_ARCHITECTURE "${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+
+# Next, match common architecture strings down to a known common value.
+if (BASE_ARCHITECTURE MATCHES "(x86)|(X86)|(amd64)|(AMD64)")
+    set(ARCHITECTURE "x86_64")
+elseif (BASE_ARCHITECTURE MATCHES "(aarch64)|(AARCH64)|(arm64)|(ARM64)")
+    set(ARCHITECTURE "arm64")
+else()
+    message(FATAL_ERROR "Unsupported CPU architecture: ${BASE_ARCHITECTURE}")
+endif()
+
+if (APPLE AND ARCHITECTURE STREQUAL "x86_64")
+    # Exclude ARM homebrew path to avoid conflicts when cross compiling.
+    list(APPEND CMAKE_IGNORE_PREFIX_PATH "/opt/homebrew")
+endif()
+
 # This function should be passed a list of all files in a target. It will automatically generate file groups
 # following the directory hierarchy, so that the layout of the files in IDEs matches the one in the filesystem.
 function(create_target_directory_groups target_name)
@@ -74,6 +95,7 @@ include(GetGitRevisionDescription)
 get_git_head_revision(GIT_REF_SPEC GIT_REV)
 git_describe(GIT_DESC --always --long --dirty)
 git_branch_name(GIT_BRANCH)
+string(TIMESTAMP BUILD_DATE "%Y-%m-%d %H:%M:%S")
 
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/common/scm_rev.cpp.in" "${CMAKE_CURRENT_SOURCE_DIR}/src/common/scm_rev.cpp" @ONLY)
 
@@ -92,6 +114,7 @@ find_package(xbyak 7.07 CONFIG)
 find_package(xxHash 0.8.2 MODULE)
 find_package(zlib-ng 2.1.7 MODULE)
 find_package(Zydis 5.0.0 CONFIG)
+find_package(pugixml 1.14 CONFIG)
 
 if (NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR NOT MSVC)
     find_package(cryptopp 8.9.0 MODULE)
@@ -121,7 +144,7 @@ add_subdirectory(externals)
 include_directories(src)
 
 if(ENABLE_QT_GUI)
-    find_package(Qt6 REQUIRED COMPONENTS Widgets Concurrent LinguistTools Network)
+    find_package(Qt6 REQUIRED COMPONENTS Widgets Concurrent LinguistTools Network Multimedia)
     qt_standard_project_setup()
     set(CMAKE_AUTORCC ON)
     set(CMAKE_AUTOMOC ON)
@@ -195,6 +218,9 @@ set(NETWORK_LIBS src/core/libraries/network/http.cpp
                  src/core/libraries/network/net.cpp
                  src/core/libraries/network/netctl.cpp
                  src/core/libraries/network/netctl.h
+                 src/core/libraries/network/net_ctl_obj.cpp
+                 src/core/libraries/network/net_ctl_obj.h
+                 src/core/libraries/network/net_ctl_codes.h
                  src/core/libraries/network/net.h
                  src/core/libraries/network/ssl.cpp
                  src/core/libraries/network/ssl.h
@@ -204,13 +230,21 @@ set(SYSTEM_LIBS src/core/libraries/system/commondialog.cpp
                 src/core/libraries/system/commondialog.h
                 src/core/libraries/system/msgdialog.cpp
                 src/core/libraries/system/msgdialog.h
+                src/core/libraries/system/msgdialog_ui.cpp
                 src/core/libraries/system/posix.cpp
                 src/core/libraries/system/posix.h
-                src/core/libraries/save_data/error_codes.h
+                src/core/libraries/save_data/save_backup.cpp
+                src/core/libraries/save_data/save_backup.h
+                src/core/libraries/save_data/save_instance.cpp
+                src/core/libraries/save_data/save_instance.h
+                src/core/libraries/save_data/save_memory.cpp
+                src/core/libraries/save_data/save_memory.h
                 src/core/libraries/save_data/savedata.cpp
                 src/core/libraries/save_data/savedata.h
-                src/core/libraries/system/savedatadialog.cpp
-                src/core/libraries/system/savedatadialog.h
+                src/core/libraries/save_data/dialog/savedatadialog.cpp
+                src/core/libraries/save_data/dialog/savedatadialog.h
+                src/core/libraries/save_data/dialog/savedatadialog_ui.cpp
+                src/core/libraries/save_data/dialog/savedatadialog_ui.h
                 src/core/libraries/system/sysmodule.cpp
                 src/core/libraries/system/sysmodule.h
                 src/core/libraries/system/systemservice.cpp
@@ -243,6 +277,11 @@ set(SYSTEM_LIBS src/core/libraries/system/commondialog.cpp
                 src/core/libraries/ngs2/ngs2_impl.cpp
                 src/core/libraries/ngs2/ngs2_impl.h
                 src/core/libraries/ajm/ajm_error.h
+                src/core/libraries/audio3d/audio3d.cpp
+                src/core/libraries/audio3d/audio3d.h
+                src/core/libraries/audio3d/audio3d_error.h
+                src/core/libraries/audio3d/audio3d_impl.cpp
+                src/core/libraries/audio3d/audio3d_impl.h
 )
 
 set(VIDEOOUT_LIB src/core/libraries/videoout/buffer.h
@@ -291,6 +330,8 @@ set(NP_LIBS src/core/libraries/np_manager/np_manager.cpp
             src/core/libraries/np_score/np_score.h
             src/core/libraries/np_trophy/np_trophy.cpp
             src/core/libraries/np_trophy/np_trophy.h
+            src/core/libraries/np_trophy/trophy_ui.cpp
+            src/core/libraries/np_trophy/trophy_ui.h
 )
 
 set(MISC_LIBS  src/core/libraries/screenshot/screenshot.cpp
@@ -308,6 +349,7 @@ set(COMMON src/common/logging/backend.cpp
            src/common/logging/text_formatter.h
            src/common/logging/types.h
            src/common/alignment.h
+           src/common/arch.h
            src/common/assert.cpp
            src/common/assert.h
            src/common/bit_field.h
@@ -315,9 +357,11 @@ set(COMMON src/common/logging/backend.cpp
            src/common/concepts.h
            src/common/config.cpp
            src/common/config.h
+           src/common/cstring.h
            src/common/debug.h
-           src/common/disassembler.cpp
-           src/common/disassembler.h
+           src/common/decoder.cpp
+           src/common/decoder.h
+           src/common/elf_info.h
            src/common/endian.h
            src/common/enum.h
            src/common/io_file.cpp
@@ -325,6 +369,7 @@ set(COMMON src/common/logging/backend.cpp
            src/common/error.cpp
            src/common/error.h
            src/common/scope_exit.h
+           src/common/fixed_value.h
            src/common/func_traits.h
            src/common/native_clock.cpp
            src/common/native_clock.h
@@ -334,6 +379,8 @@ set(COMMON src/common/logging/backend.cpp
            src/common/polyfill_thread.h
            src/common/rdtsc.cpp
            src/common/rdtsc.h
+           src/common/signal_context.h
+           src/common/signal_context.cpp
            src/common/singleton.h
            src/common/slot_vector.h
            src/common/string_util.cpp
@@ -346,6 +393,8 @@ set(COMMON src/common/logging/backend.cpp
            src/common/version.h
            src/common/ntapi.h
            src/common/ntapi.cpp
+           src/common/memory_patcher.h
+           src/common/memory_patcher.cpp
            src/common/scm_rev.cpp
            src/common/scm_rev.h
 )
@@ -356,8 +405,6 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/aerolib/aerolib.h
          src/core/address_space.cpp
          src/core/address_space.h
-         src/core/cpu_patches.cpp
-         src/core/cpu_patches.h
          src/core/crypto/crypto.cpp
          src/core/crypto/crypto.h
          src/core/crypto/keys.h
@@ -409,11 +456,19 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/module.cpp
          src/core/module.h
          src/core/platform.h
+         src/core/signals.cpp
+         src/core/signals.h
          src/core/tls.cpp
          src/core/tls.h
          src/core/virtual_memory.cpp
          src/core/virtual_memory.h
 )
+
+if (ARCHITECTURE STREQUAL "x86_64")
+    set(CORE ${CORE}
+             src/core/cpu_patches.cpp
+             src/core/cpu_patches.h)
+endif()
 
 set(SHADER_RECOMPILER src/shader_recompiler/exception.h
                       src/shader_recompiler/profile.h
@@ -423,6 +478,7 @@ set(SHADER_RECOMPILER src/shader_recompiler/exception.h
                       src/shader_recompiler/params.h
                       src/shader_recompiler/runtime_info.h
                       src/shader_recompiler/specialization.h
+                      src/shader_recompiler/backend/bindings.h
                       src/shader_recompiler/backend/spirv/emit_spirv.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv.h
                       src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
@@ -528,6 +584,8 @@ set(VIDEO_CORE src/video_core/amdgpu/liverpool.cpp
                src/video_core/renderer_vulkan/vk_master_semaphore.h
                src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
                src/video_core/renderer_vulkan/vk_pipeline_cache.h
+               src/video_core/renderer_vulkan/vk_pipeline_common.cpp
+               src/video_core/renderer_vulkan/vk_pipeline_common.h
                src/video_core/renderer_vulkan/vk_platform.cpp
                src/video_core/renderer_vulkan/vk_platform.h
                src/video_core/renderer_vulkan/vk_rasterizer.cpp
@@ -561,6 +619,22 @@ set(VIDEO_CORE src/video_core/amdgpu/liverpool.cpp
                src/video_core/renderdoc.h
 )
 
+set(IMGUI src/imgui/imgui_config.h
+          src/imgui/imgui_layer.h
+          src/imgui/imgui_std.h
+          src/imgui/imgui_texture.h
+          src/imgui/layer/video_info.cpp
+          src/imgui/layer/video_info.h
+          src/imgui/renderer/imgui_core.cpp
+          src/imgui/renderer/imgui_core.h
+          src/imgui/renderer/imgui_impl_sdl3.cpp
+          src/imgui/renderer/imgui_impl_sdl3.h
+          src/imgui/renderer/imgui_impl_vulkan.cpp
+          src/imgui/renderer/imgui_impl_vulkan.h
+          src/imgui/renderer/texture_manager.cpp
+          src/imgui/renderer/texture_manager.h
+)
+
 set(INPUT src/input/controller.cpp
           src/input/controller.h
 )
@@ -579,10 +653,12 @@ qt_add_resources(RESOURCE_FILES src/shadps4.qrc)
 set(QT_GUI src/qt_gui/about_dialog.cpp
            src/qt_gui/about_dialog.h
            src/qt_gui/about_dialog.ui
+           src/qt_gui/background_music_player.cpp
+           src/qt_gui/background_music_player.h
            src/qt_gui/cheats_patches.cpp
            src/qt_gui/cheats_patches.h
-           src/qt_gui/memory_patcher.cpp
-           src/qt_gui/memory_patcher.h
+           src/qt_gui/check_update.cpp
+           src/qt_gui/check_update.h
            src/qt_gui/main_window_ui.h
            src/qt_gui/main_window.cpp
            src/qt_gui/main_window.h
@@ -617,6 +693,7 @@ endif()
 if (ENABLE_QT_GUI)
     qt_add_executable(shadps4
         ${AUDIO_CORE}
+        ${IMGUI}
         ${INPUT}
         ${QT_GUI}
         ${COMMON}
@@ -629,6 +706,7 @@ if (ENABLE_QT_GUI)
 else()
     add_executable(shadps4
         ${AUDIO_CORE}
+        ${IMGUI}
         ${INPUT}
         ${COMMON}
         ${CORE}
@@ -645,8 +723,11 @@ endif()
 
 create_target_directory_groups(shadps4)
 
-target_link_libraries(shadps4 PRIVATE magic_enum::magic_enum fmt::fmt toml11::toml11 tsl::robin_map xbyak::xbyak Tracy::TracyClient RenderDoc::API FFmpeg::ffmpeg)
-target_link_libraries(shadps4 PRIVATE Boost::headers GPUOpen::VulkanMemoryAllocator sirit Vulkan::Headers xxHash::xxhash Zydis::Zydis glslang::SPIRV glslang::glslang SDL3::SDL3)
+target_link_libraries(shadps4 PRIVATE magic_enum::magic_enum fmt::fmt toml11::toml11 tsl::robin_map xbyak::xbyak Tracy::TracyClient RenderDoc::API FFmpeg::ffmpeg Dear_ImGui)
+target_link_libraries(shadps4 PRIVATE Boost::headers GPUOpen::VulkanMemoryAllocator sirit Vulkan::Headers xxHash::xxhash Zydis::Zydis glslang::SPIRV glslang::glslang SDL3::SDL3 pugixml::pugixml)
+
+target_compile_definitions(shadps4 PRIVATE IMGUI_USER_CONFIG="imgui/imgui_config.h")
+target_compile_definitions(Dear_ImGui PRIVATE IMGUI_USER_CONFIG="${PROJECT_SOURCE_DIR}/src/imgui/imgui_config.h")
 
 if (APPLE)
   option(USE_SYSTEM_VULKAN_LOADER "Enables using the system Vulkan loader instead of directly linking with MoltenVK. Useful for loading validation layers." OFF)
@@ -658,8 +739,10 @@ if (APPLE)
       target_link_libraries(shadps4 PRIVATE ${MOLTENVK})
   endif()
 
-  # Reserve system-managed memory space.
-  target_link_options(shadps4 PRIVATE -Wl,-no_pie,-no_fixup_chains,-no_huge,-pagezero_size,0x4000,-segaddr,TCB_SPACE,0x4000,-segaddr,GUEST_SYSTEM,0x400000,-image_base,0x20000000000)
+  if (ARCHITECTURE STREQUAL "x86_64")
+      # Reserve system-managed memory space.
+      target_link_options(shadps4 PRIVATE -Wl,-no_pie,-no_fixup_chains,-no_huge,-pagezero_size,0x4000,-segaddr,TCB_SPACE,0x4000,-segaddr,GUEST_SYSTEM,0x400000,-image_base,0x20000000000)
+  endif()
 
   # Replacement for std::chrono::time_zone
   target_link_libraries(shadps4 PRIVATE date::date-tz)
@@ -679,7 +762,7 @@ else()
 endif()
 
 if (ENABLE_QT_GUI)
-   target_link_libraries(shadps4 PRIVATE Qt6::Widgets Qt6::Concurrent Qt6::Network)
+   target_link_libraries(shadps4 PRIVATE Qt6::Widgets Qt6::Concurrent Qt6::Network Qt6::Multimedia)
    add_definitions(-DENABLE_QT_GUI)
 endif()
 
@@ -734,6 +817,11 @@ set(HOST_SHADERS_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/src/video_core/host_shaders
 add_subdirectory(${HOST_SHADERS_INCLUDE})
 add_dependencies(shadps4 host_shaders)
 target_include_directories(shadps4 PRIVATE ${HOST_SHADERS_INCLUDE})
+
+# ImGui resources
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/src/imgui/renderer)
+add_dependencies(shadps4 ImGui_Resources)
+target_include_directories(shadps4 PRIVATE ${IMGUI_RESOURCES_INCLUDE})
 
 if (ENABLE_QT_GUI)
     set_target_properties(shadps4 PROPERTIES

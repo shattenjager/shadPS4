@@ -9,6 +9,7 @@
 #include "common/config.h"
 #include "common/version.h"
 #include "core/libraries/pad/pad.h"
+#include "imgui/renderer/imgui_core.h"
 #include "input/controller.h"
 #include "sdl_window.h"
 #include "video_core/renderdoc.h"
@@ -35,6 +36,7 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameController* controller_
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, width);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, height);
     SDL_SetNumberProperty(props, "flags", SDL_WINDOW_VULKAN);
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
     window = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
     if (window == nullptr) {
@@ -80,6 +82,10 @@ void WindowSDL::waitEvent() {
         return;
     }
 
+    if (ImGui::Core::ProcessEvent(&event)) {
+        return;
+    }
+
     switch (event.type) {
     case SDL_EVENT_WINDOW_RESIZED:
     case SDL_EVENT_WINDOW_MAXIMIZED:
@@ -115,6 +121,7 @@ void WindowSDL::waitEvent() {
 
 void WindowSDL::onResize() {
     SDL_GetWindowSizeInPixels(window, &width, &height);
+    ImGui::Core::OnResize();
 }
 
 void WindowSDL::onKeyPress(const SDL_Event* event) {

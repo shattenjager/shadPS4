@@ -24,7 +24,6 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
-    wfi_event = instance.GetDevice().createEventUnique({});
 }
 
 Rasterizer::~Rasterizer() = default;
@@ -62,7 +61,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     buffer_cache.BindVertexBuffers(vs_info);
     const u32 num_indices = buffer_cache.BindIndexBuffer(is_indexed, index_offset);
 
-    BeginRendering();
+    BeginRendering(*pipeline);
     UpdateDynamicState(*pipeline);
 
     const auto [vertex_offset, instance_offset] = vs_info.GetDrawOffsets();
@@ -102,7 +101,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr address, u32 offset, u32 si
     buffer_cache.BindVertexBuffers(vs_info);
     const u32 num_indices = buffer_cache.BindIndexBuffer(is_indexed, 0);
 
-    BeginRendering();
+    BeginRendering(*pipeline);
     UpdateDynamicState(*pipeline);
 
     const auto [buffer, base] = buffer_cache.ObtainBuffer(address, size, true);
@@ -179,7 +178,7 @@ void Rasterizer::Finish() {
     scheduler.Finish();
 }
 
-void Rasterizer::BeginRendering() {
+void Rasterizer::BeginRendering(const GraphicsPipeline& pipeline) {
     const auto& regs = liverpool->regs;
     RenderState state;
 
@@ -196,6 +195,13 @@ void Rasterizer::BeginRendering() {
         // If the color buffer is still bound but rendering to it is disabled by the target mask,
         // we need to prevent the render area from being affected by unbound render target extents.
         if (!regs.color_target_mask.GetMask(col_buf_id)) {
+            continue;
+        }
+
+        // Skip stale color buffers if shader doesn't output to them. Otherwise it will perform
+        // an unnecessary transition and may result in state conflict if the resource is already
+        // bound for reading.
+        if ((pipeline.GetMrtMask() & (1 << col_buf_id)) == 0) {
             continue;
         }
 
@@ -240,7 +246,7 @@ void Rasterizer::BeginRendering() {
         state.depth_image = image.image;
         state.depth_attachment = {
             .imageView = *image_view.image_view,
-            .imageLayout = image.layout,
+            .imageLayout = image.last_state.layout,
             .loadOp = is_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
             .storeOp = is_clear ? vk::AttachmentStoreOp::eNone : vk::AttachmentStoreOp::eStore,
             .clearValue = vk::ClearValue{.depthStencil = {.depth = regs.depth_clear,
@@ -297,6 +303,43 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline& pipeline) {
         cmdbuf.setColorWriteEnableEXT(write_ens);
         cmdbuf.setColorWriteMaskEXT(0, write_masks);
     }
+    if (regs.depth_control.depth_bounds_enable) {
+        cmdbuf.setDepthBounds(regs.depth_bounds_min, regs.depth_bounds_max);
+    }
+    if (regs.polygon_control.NeedsBias()) {
+        if (regs.polygon_control.enable_polygon_offset_front) {
+            cmdbuf.setDepthBias(regs.poly_offset.front_offset, regs.poly_offset.depth_bias,
+                                regs.poly_offset.front_scale);
+        } else {
+            cmdbuf.setDepthBias(regs.poly_offset.back_offset, regs.poly_offset.depth_bias,
+                                regs.poly_offset.back_scale);
+        }
+    }
+    if (regs.depth_control.stencil_enable) {
+        const auto front = regs.stencil_ref_front;
+        const auto back = regs.stencil_ref_back;
+        if (front.stencil_test_val == back.stencil_test_val) {
+            cmdbuf.setStencilReference(vk::StencilFaceFlagBits::eFrontAndBack,
+                                       front.stencil_test_val);
+        } else {
+            cmdbuf.setStencilReference(vk::StencilFaceFlagBits::eFront, front.stencil_test_val);
+            cmdbuf.setStencilReference(vk::StencilFaceFlagBits::eBack, back.stencil_test_val);
+        }
+        if (front.stencil_write_mask == back.stencil_write_mask) {
+            cmdbuf.setStencilWriteMask(vk::StencilFaceFlagBits::eFrontAndBack,
+                                       front.stencil_write_mask);
+        } else {
+            cmdbuf.setStencilWriteMask(vk::StencilFaceFlagBits::eFront, front.stencil_write_mask);
+            cmdbuf.setStencilWriteMask(vk::StencilFaceFlagBits::eBack, back.stencil_write_mask);
+        }
+        if (front.stencil_mask == back.stencil_mask) {
+            cmdbuf.setStencilCompareMask(vk::StencilFaceFlagBits::eFrontAndBack,
+                                         front.stencil_mask);
+        } else {
+            cmdbuf.setStencilCompareMask(vk::StencilFaceFlagBits::eFront, front.stencil_mask);
+            cmdbuf.setStencilCompareMask(vk::StencilFaceFlagBits::eBack, back.stencil_mask);
+        }
+    }
 }
 
 void Rasterizer::UpdateViewportScissorState() {
@@ -306,7 +349,10 @@ void Rasterizer::UpdateViewportScissorState() {
     boost::container::static_vector<vk::Rect2D, Liverpool::NumViewports> scissors;
 
     const float reduce_z =
-        regs.clipper_control.clip_space == AmdGpu::Liverpool::ClipSpace::MinusWToW ? 1.0f : 0.0f;
+        instance.IsDepthClipControlSupported() &&
+                regs.clipper_control.clip_space == AmdGpu::Liverpool::ClipSpace::MinusWToW
+            ? 1.0f
+            : 0.0f;
     for (u32 i = 0; i < Liverpool::NumViewports; i++) {
         const auto& vp = regs.viewports[i];
         const auto& vp_d = regs.viewport_depths[i];

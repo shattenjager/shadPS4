@@ -11,7 +11,6 @@
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/thread.h"
-#include "core/cpu_patches.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/kernel/libkernel.h"
 #include "core/libraries/kernel/thread_management.h"
@@ -53,11 +52,12 @@ void init_pthreads() {
 }
 
 void pthreadInitSelfMainThread() {
+    const char* name = "Main_Thread";
     auto* pthread_pool = g_pthread_cxt->GetPthreadPool();
-    g_pthread_self = pthread_pool->Create();
+    g_pthread_self = pthread_pool->Create(name);
     scePthreadAttrInit(&g_pthread_self->attr);
     g_pthread_self->pth = pthread_self();
-    g_pthread_self->name = "Main_Thread";
+    g_pthread_self->name = name;
 }
 
 int PS4_SYSV_ABI scePthreadAttrInit(ScePthreadAttr* attr) {
@@ -652,7 +652,7 @@ int PS4_SYSV_ABI scePthreadCondInit(ScePthreadCond* cond, const ScePthreadCondat
     int result = pthread_cond_init(&(*cond)->cond, &(*attr)->cond_attr);
 
     if (name != nullptr) {
-        LOG_INFO(Kernel_Pthread, "name={}, result={}", (*cond)->name, result);
+        LOG_TRACE(Kernel_Pthread, "name={}, result={}", (*cond)->name, result);
     }
 
     switch (result) {
@@ -989,14 +989,12 @@ static void cleanup_thread(void* arg) {
 static void* run_thread(void* arg) {
     auto* thread = static_cast<ScePthread>(arg);
     Common::SetCurrentThreadName(thread->name.c_str());
-    Core::InitializeThreadPatchStack();
     auto* linker = Common::Singleton<Core::Linker>::Instance();
-    linker->InitTlsForThread(false);
     void* ret = nullptr;
     g_pthread_self = thread;
     pthread_cleanup_push(cleanup_thread, thread);
     thread->is_started = true;
-    ret = thread->entry(thread->arg);
+    ret = linker->ExecuteGuest(thread->entry, thread->arg);
     pthread_cleanup_pop(1);
     return ret;
 }
@@ -1013,7 +1011,7 @@ int PS4_SYSV_ABI scePthreadCreate(ScePthread* thread, const ScePthreadAttr* attr
         attr = g_pthread_cxt->GetDefaultAttr();
     }
 
-    *thread = pthread_pool->Create();
+    *thread = pthread_pool->Create(name);
 
     if ((*thread)->attr != nullptr) {
         scePthreadAttrDestroy(&(*thread)->attr);
@@ -1055,11 +1053,11 @@ int PS4_SYSV_ABI scePthreadCreate(ScePthread* thread, const ScePthreadAttr* attr
     }
 }
 
-ScePthread PThreadPool::Create() {
+ScePthread PThreadPool::Create(const char* name) {
     std::scoped_lock lock{m_mutex};
 
     for (auto* p : m_threads) {
-        if (p->is_free) {
+        if (p->is_free && name != nullptr && p->name == name) {
             p->is_free = false;
             return p;
         }
@@ -1182,6 +1180,7 @@ int PS4_SYSV_ABI scePthreadCondattrDestroy(ScePthreadCondattr* attr) {
     int result = pthread_condattr_destroy(&(*attr)->cond_attr);
 
     LOG_DEBUG(Kernel_Pthread, "scePthreadCondattrDestroy: result = {} ", result);
+    delete *attr;
 
     switch (result) {
     case 0:
@@ -1487,6 +1486,8 @@ int PS4_SYSV_ABI scePthreadOnce(int* once_control, void (*init_routine)(void)) {
 }
 
 [[noreturn]] void PS4_SYSV_ABI scePthreadExit(void* value_ptr) {
+    g_pthread_self->is_free = true;
+
     pthread_exit(value_ptr);
     UNREACHABLE();
 }
@@ -1505,6 +1506,10 @@ int PS4_SYSV_ABI scePthreadGetprio(ScePthread thread, int* prio) {
     return ORBIS_OK;
 }
 int PS4_SYSV_ABI scePthreadSetprio(ScePthread thread, int prio) {
+    if (thread == nullptr) {
+        LOG_ERROR(Kernel_Pthread, "scePthreadSetprio: thread is nullptr");
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
     thread->prio = prio;
     return ORBIS_OK;
 }
